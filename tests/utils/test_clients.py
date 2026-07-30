@@ -10,18 +10,13 @@ Tests cover:
 """
 
 import contextlib
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock, Usage
-from openai.types.chat import ChatCompletion, ChatCompletionChunk
-from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
-from openai.types.chat.chat_completion_chunk import ChoiceDelta
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
-from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel, Field
 
 from src.config import (
@@ -47,6 +42,27 @@ class SampleTestModel(BaseModel):
     name: str
     age: int
     active: bool = Field(default=True)
+
+
+def _openai_response(
+    content: str = "",
+    *,
+    parsed: Any = None,
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        output_text=content,
+        output=[],
+        output_parsed=parsed,
+        status="completed",
+        incomplete_details=None,
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            input_tokens_details=None,
+        ),
+    )
 
 
 class TestLLMCallResponse:
@@ -248,235 +264,116 @@ class TestAnthropicClient:
 
 @pytest.mark.asyncio
 class TestOpenAIClient:
-    """Tests for OpenAI client functionality"""
+    """Tests for the Responses API OpenAI client path."""
 
     async def test_openai_basic_call(self):
-        """Test basic OpenAI API call"""
         from openai import AsyncOpenAI
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-4",
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(
-                        role="assistant", content="Hello from OpenAI"
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=5, total_tokens=15
-            ),
+        mock_client.responses.create = AsyncMock(
+            return_value=_openai_response("Hello from OpenAI")
         )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
-                provider="openai", model="gpt-4", prompt="Hello", max_tokens=100
+                provider="openai", model="gpt-5.6-luna", prompt="Hello", max_tokens=100
             )
 
-            assert isinstance(response, HonchoLLMCallResponse)
-            assert response.content == "Hello from OpenAI"
-            assert response.output_tokens == 5
-            assert response.finish_reasons == ["stop"]
+        assert isinstance(response, HonchoLLMCallResponse)
+        assert response.content == "Hello from OpenAI"
+        assert response.output_tokens == 5
+        assert response.finish_reasons == ["stop"]
+        mock_client.responses.create.assert_awaited_once()
 
-    async def test_openai_gpt5_parameters(self):
-        """Test OpenAI GPT-5 specific parameters"""
+    async def test_openai_reasoning_parameters(self):
         from openai import AsyncOpenAI
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-5-turbo",
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(
-                        role="assistant", content="GPT-5 response"
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=5, total_tokens=15
-            ),
+        mock_client.responses.create = AsyncMock(
+            return_value=_openai_response("reasoned response")
         )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
-            _response = await honcho_llm_call_inner(
+            await honcho_llm_call_inner(
                 provider="openai",
-                model="gpt-5-turbo",
+                model="gpt-5.6-luna",
                 prompt="Hello",
                 max_tokens=100,
                 reasoning_effort="high",
                 verbosity="medium",
             )
 
-            # Verify GPT-5 specific parameters were used
-            mock_client.chat.completions.create.assert_called_once()
-            call_args = mock_client.chat.completions.create.call_args
-            kwargs = call_args.kwargs
-            assert "max_completion_tokens" in kwargs
-            assert kwargs["max_completion_tokens"] == 100
-            assert kwargs["reasoning_effort"] == "high"
-            assert kwargs["verbosity"] == "medium"
+        kwargs = mock_client.responses.create.await_args.kwargs
+        assert kwargs["max_output_tokens"] == 100
+        assert kwargs["reasoning"] == {"effort": "high"}
+        assert kwargs["text"]["verbosity"] == "medium"
+        assert kwargs["store"] is False
 
     async def test_openai_json_mode(self):
-        """Test OpenAI with JSON mode"""
         from openai import AsyncOpenAI
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-4",
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(
-                        role="assistant", content='{"result": "success"}'
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=5, total_tokens=15
-            ),
+        mock_client.responses.create = AsyncMock(
+            return_value=_openai_response('{"result": "success"}')
         )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
-            _response = await honcho_llm_call_inner(
+            await honcho_llm_call_inner(
                 provider="openai",
-                model="gpt-4",
+                model="gpt-5.6-luna",
                 prompt="Generate JSON",
                 max_tokens=100,
                 json_mode=True,
             )
 
-            # Verify JSON mode was enabled
-            mock_client.chat.completions.create.assert_called_once()
-            call_args = mock_client.chat.completions.create.call_args
-            assert call_args.kwargs["response_format"] == {"type": "json_object"}
+        kwargs = mock_client.responses.create.await_args.kwargs
+        assert kwargs["text"] == {"format": {"type": "json_object"}}
 
     async def test_openai_response_model(self):
-        """Test OpenAI with structured output (response model)"""
         from openai import AsyncOpenAI
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-
-        # Create a mock parsed object
-        mock_parsed = SampleTestModel(name="John", age=30)
-
-        # Create a proper ChatCompletionMessage and add parsed attribute
-        message = ChatCompletionMessage(role="assistant", content="")
-        setattr(message, "parsed", mock_parsed)  # noqa: B010
-
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-4",
-            choices=[
-                Choice(
-                    index=0,
-                    message=message,
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=15, total_tokens=25
-            ),
+        mock_client.responses.create = AsyncMock(
+            return_value=_openai_response('{"name":"John","age":30}', output_tokens=15)
         )
-        mock_client.chat.completions.parse = AsyncMock(return_value=mock_response)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
                 provider="openai",
-                model="gpt-4",
+                model="gpt-5.6-luna",
                 prompt="Generate a person",
                 max_tokens=100,
                 response_model=SampleTestModel,
             )
 
-            assert isinstance(response, HonchoLLMCallResponse)
-            assert isinstance(response.content, SampleTestModel)
-            assert response.content.name == "John"
-            assert response.content.age == 30
-            assert response.output_tokens == 15
-
-            # Verify parse was called instead of create
-            mock_client.chat.completions.parse.assert_called_once()
-            mock_client.chat.completions.create.assert_not_called()
+        assert isinstance(response.content, SampleTestModel)
+        assert response.content.name == "John"
+        assert response.content.age == 30
+        assert response.output_tokens == 15
+        mock_client.responses.create.assert_awaited_once()
 
     async def test_openai_streaming(self):
-        """Test OpenAI streaming response"""
         from openai import AsyncOpenAI
 
-        mock_client = AsyncMock(spec=AsyncOpenAI)
-
-        # Create mock streaming chunks
-        mock_chunks = [
-            ChatCompletionChunk(
-                id="test-id",
-                object="chat.completion.chunk",
-                created=1234567890,
-                model="gpt-4",
-                choices=[
-                    ChunkChoice(
-                        index=0, delta=ChoiceDelta(content="Hello"), finish_reason=None
-                    )
-                ],
-            ),
-            ChatCompletionChunk(
-                id="test-id",
-                object="chat.completion.chunk",
-                created=1234567890,
-                model="gpt-4",
-                choices=[
-                    ChunkChoice(
-                        index=0, delta=ChoiceDelta(content=" world"), finish_reason=None
-                    )
-                ],
-            ),
-            ChatCompletionChunk(
-                id="test-id",
-                object="chat.completion.chunk",
-                created=1234567890,
-                model="gpt-4",
-                choices=[
-                    ChunkChoice(
-                        index=0, delta=ChoiceDelta(content=None), finish_reason="stop"
-                    )
-                ],
-            ),
+        final = _openai_response("Hello world")
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hello"),
+            SimpleNamespace(type="response.output_text.delta", delta=" world"),
+            SimpleNamespace(type="response.completed", response=final),
         ]
 
-        # Create async iterator
-        async def async_chunk_iterator():
-            for chunk in mock_chunks:
-                yield chunk
+        async def event_stream():
+            for event in events:
+                yield event
 
-        # OpenAI's create method returns an awaitable that resolves to an async iterator
-        async def mock_create(**_kwargs: Any):
-            return async_chunk_iterator()
-
-        mock_client.chat.completions.create = mock_create
+        mock_client = AsyncMock(spec=AsyncOpenAI)
+        mock_client.responses.create = AsyncMock(return_value=event_stream())
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             chunks: list[HonchoLLMCallStreamChunk] = []
             stream = await honcho_llm_call_inner(
                 provider="openai",
-                model="gpt-4",
+                model="gpt-5.6-luna",
                 prompt="Hello",
                 max_tokens=100,
                 stream=True,
@@ -486,12 +383,10 @@ class TestOpenAIClient:
             async for chunk in stream:
                 chunks.append(chunk)
 
-            assert len(chunks) == 3
-            assert chunks[0].content == "Hello"
-            assert chunks[1].content == " world"
-            assert chunks[2].content == ""
-            assert chunks[2].is_done is True
-            assert chunks[2].finish_reasons == ["stop"]
+        assert [chunk.content for chunk in chunks] == ["Hello", " world", ""]
+        assert chunks[-1].is_done is True
+        assert chunks[-1].finish_reasons == ["stop"]
+        assert mock_client.responses.create.await_args.kwargs["stream"] is True
 
 
 @pytest.mark.asyncio
@@ -1181,27 +1076,11 @@ class TestModelConfigExtraParamsPropagation:
     lock in that each backend now receives them.
     """
 
-    async def test_openai_propagates_top_p_frequency_seed(self):
+    async def test_openai_propagates_supported_sampling_params(self):
         from openai import AsyncOpenAI
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-4.1",
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(role="assistant", content="ok"),
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=5, total_tokens=15
-            ),
-        )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client.responses.create = AsyncMock(return_value=_openai_response("ok"))
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             await honcho_llm_call(
@@ -1218,12 +1097,12 @@ class TestModelConfigExtraParamsPropagation:
                 enable_retry=False,
             )
 
-            mock_client.chat.completions.create.assert_called_once()
-            kwargs = mock_client.chat.completions.create.call_args.kwargs
+            mock_client.responses.create.assert_awaited_once()
+            kwargs = mock_client.responses.create.await_args.kwargs
             assert kwargs["top_p"] == 0.92
-            assert kwargs["frequency_penalty"] == 0.5
-            assert kwargs["presence_penalty"] == 0.1
-            assert kwargs["seed"] == 42
+            assert "frequency_penalty" not in kwargs
+            assert "presence_penalty" not in kwargs
+            assert "seed" not in kwargs
 
     async def test_anthropic_propagates_top_p_top_k(self):
         mock_client = AsyncMock(spec=AsyncAnthropic)
@@ -1267,23 +1146,7 @@ class TestModelConfigExtraParamsPropagation:
         from openai import AsyncOpenAI
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-4.1",
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(role="assistant", content="ok"),
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=5, total_tokens=15
-            ),
-        )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client.responses.create = AsyncMock(return_value=_openai_response("ok"))
 
         captured_extra: dict[str, Any] = {}
 
@@ -1360,23 +1223,7 @@ class TestModelConfigExtraParamsPropagation:
         from src.llm.backends.openai import OpenAIBackend
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_response = ChatCompletion(
-            id="test-id",
-            object="chat.completion",
-            created=1234567890,
-            model="gpt-4.1",
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(role="assistant", content="{}"),
-                    finish_reason="stop",
-                )
-            ],
-            usage=CompletionUsage(
-                prompt_tokens=10, completion_tokens=5, total_tokens=15
-            ),
-        )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client.responses.create = AsyncMock(return_value=_openai_response("{}"))
 
         captured_extra: dict[str, Any] = {}
         original_complete = OpenAIBackend.complete
