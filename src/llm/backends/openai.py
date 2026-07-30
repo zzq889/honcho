@@ -6,7 +6,8 @@ import weakref
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
-from openai import BadRequestError, LengthFinishReasonError
+from openai import BadRequestError
+from openai.lib._pydantic import to_strict_json_schema
 from pydantic import BaseModel, ValidationError
 
 from src.exceptions import ValidationException
@@ -22,13 +23,9 @@ from src.llm.structured_output import (
     repair_response_model_json,
     validate_structured_output,
 )
-from src.utils.representation import PromptRepresentation
 
 logger = logging.getLogger(__name__)
-
-# extra_body keys that request thinking from an OpenAI-compatible proxy.
 _EXTRA_BODY_THINKING_KEYS = ("reasoning", "reasoning_effort", "thinking")
-
 
 # The point of this being a WeakKeyDictionary, as opposed to a regular dict, is that it
 # does not hold a reference to the keyed BaseModel so that when a dynamically created
@@ -72,99 +69,64 @@ def _json_object_instruction(
     return instruction
 
 
-def _uses_max_completion_tokens(model: str) -> bool:
-    """OpenAI reasoning models (gpt-5+ family + o-series) require
-    ``max_completion_tokens`` instead of the classic ``max_tokens`` parameter.
-
-    Matches: gpt-5, gpt-5-anything, gpt-5.anything (incl. gpt-5.4, gpt-5.4-mini,
-    gpt-5.6-sol), gpt-6, gpt-6-anything and gpt-6.anything (gpt-6-astra,
-    gpt-6-sol, gpt-6-luna), o1*, o3*, o4*.
-    Anything else (gpt-4.x, gpt-4o, chat models on proxies) stays on
-    ``max_tokens``.
-    """
-    m = model.lower()
-    for base in ("gpt-5", "gpt-6"):
-        if m == base or m.startswith(base + "-") or m.startswith(base + "."):
-            return True
-    for prefix in ("o1", "o3", "o4"):
-        if m == prefix or m.startswith(prefix + "-"):
-            return True
-    return False
-
-
-def extract_openai_reasoning_content(response: Any) -> str | None:
-    try:
-        message = response.choices[0].message
-        if hasattr(message, "reasoning_details") and message.reasoning_details:
-            reasoning_parts: list[str] = []
-            for detail in message.reasoning_details:
-                detail_content = getattr(detail, "content", None)
-                if isinstance(detail_content, str) and detail_content:
-                    reasoning_parts.append(detail_content)
-                elif isinstance(detail, dict):
-                    detail_dict = cast(dict[str, Any], detail)
-                    dict_content = detail_dict.get("content")
-                    if isinstance(dict_content, str) and dict_content:
-                        reasoning_parts.append(dict_content)
-            if reasoning_parts:
-                return "\n".join(reasoning_parts)
-        if hasattr(message, "reasoning_content") and message.reasoning_content:
-            return message.reasoning_content
-    except (AttributeError, IndexError, TypeError):
-        return None
-    return None
-
-
-def extract_openai_reasoning_details(response: Any) -> list[dict[str, Any]]:
-    try:
-        message = response.choices[0].message
-        if hasattr(message, "reasoning_details") and message.reasoning_details:
-            details: list[dict[str, Any]] = []
-            for detail in message.reasoning_details:
-                if hasattr(detail, "model_dump"):
-                    dumped = detail.model_dump()
-                    if isinstance(dumped, dict):
-                        details.append(cast(dict[str, Any], dumped))
-                elif isinstance(detail, dict):
-                    details.append(cast(dict[str, Any], detail))
-                else:
-                    detail_content = getattr(detail, "content", None)
-                    if isinstance(detail_content, str) and detail_content:
-                        details.append({"content": detail_content})
-            return details
-    except (AttributeError, IndexError, TypeError):
-        return []
-    return []
-
-
 def extract_openai_cache_tokens(usage: Any) -> tuple[int, int]:
+    """Return cache creation/read tokens across Responses usage variants."""
     if not usage:
         return 0, 0
 
     cache_read = 0
-    if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
-        details = usage.prompt_tokens_details
-        if hasattr(details, "cached_tokens") and details.cached_tokens:
-            cache_read = details.cached_tokens
-
+    details = getattr(usage, "input_tokens_details", None)
+    if details:
+        cache_read = getattr(details, "cached_tokens", 0) or 0
     if cache_read == 0:
-        if hasattr(usage, "cache_read_input_tokens") and usage.cache_read_input_tokens:
-            cache_read = usage.cache_read_input_tokens
-        elif hasattr(usage, "cached_tokens") and usage.cached_tokens:
-            cache_read = usage.cached_tokens
+        # Retain compatibility with proxy usage objects returned through the SDK.
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+        cache_read = (
+            cache_read
+            or getattr(usage, "cache_read_input_tokens", 0)
+            or getattr(usage, "cached_tokens", 0)
+            or 0
+        )
 
-    cache_creation = 0
-    if (
-        hasattr(usage, "cache_creation_input_tokens")
-        and usage.cache_creation_input_tokens
-    ):
-        cache_creation = usage.cache_creation_input_tokens
-
+    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
     return cache_creation, cache_read
 
 
+def extract_openai_reasoning_details(response: Any) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "reasoning":
+            continue
+        if hasattr(item, "model_dump"):
+            dumped = item.model_dump()
+            if isinstance(dumped, dict):
+                details.append(cast(dict[str, Any], dumped))
+        elif isinstance(item, dict):
+            details.append(cast(dict[str, Any], item))
+    return details
+
+
+def extract_openai_reasoning_content(response: Any) -> str | None:
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "reasoning":
+            continue
+        summary = getattr(item, "summary", None) or []
+        for summary_part in summary:
+            text = (
+                summary_part.get("text")
+                if isinstance(summary_part, dict)
+                else getattr(summary_part, "text", None)
+            )
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts) if parts else None
+
+
 class OpenAIBackend:
-    """Provider backend wrapping AsyncOpenAI."""
+    """OpenAI provider backend using the Responses API exclusively."""
 
     def __init__(self, client: Any) -> None:
         self._client: Any = client
@@ -185,124 +147,68 @@ class OpenAIBackend:
         max_output_tokens: int | None = None,
         extra_params: dict[str, Any] | None = None,
     ) -> CompletionResult:
+        # Responses has no stop-sequence parameter. Keep the ProviderBackend
+        # signature stable, but intentionally do not forward it.
+        del stop
+        effective_max_tokens = max_output_tokens or max_tokens
+
         params = self._build_params(
             model=model,
             messages=messages,
-            max_tokens=max_output_tokens or max_tokens,
+            max_tokens=effective_max_tokens,
             temperature=temperature,
-            stop=stop,
             tools=tools,
             tool_choice=tool_choice,
             thinking_effort=thinking_effort,
             thinking_budget_tokens=thinking_budget_tokens,
             extra_params=extra_params,
         )
+
         structured_output_mode = self._resolve_thinking_conflict(
             params, model, extra_params, response_format
         )
-
+        json_object_model = (
+            response_format
+            if isinstance(response_format, type)
+            and structured_output_mode == "json_object"
+            else None
+        )
+        if json_object_model is not None:
+            params["input"] = self._convert_messages(
+                self._with_json_schema_instructions(
+                    messages, json_object_model, tools_present=bool(tools)
+                )
+            )
         if isinstance(response_format, type):
-            if structured_output_mode == "json_object":
-                self._apply_json_object_mode(params, response_format)
-                response = await self._client.chat.completions.create(**params)
-                if getattr(response.choices[0].message, "tool_calls", None):
-                    return self._normalize_response(response)
-                # A loose provider that returns nothing shouldn't crash the call.
-                content = self._parse_or_repair_structured_content(
-                    response, response_format, model, empty_on_missing=True
+            params["text"] = {
+                "format": self._responses_json_format(
+                    response_format, json_object=json_object_model is not None
                 )
-                return self._normalize_response(response, content_override=content)
-            if tools:
-                # parse() refuses non-strict function tools, and our agent tool
-                # schemas are deliberately non-strict (see _convert_tools), so
-                # tool-loop iterations use create() with an explicit json_schema
-                # response_format — same server-side schema enforcement, no
-                # strict-tools requirement — mirroring the streaming path.
-                params["response_format"] = self._json_schema_response_format(
-                    response_format
-                )
-                response = await self._client.chat.completions.create(**params)
-                # Tool-call turns carry no consumable content — the tool loop
-                # ignores it — and parsing their empty text would raise.
-                if getattr(response.choices[0].message, "tool_calls", None):
-                    return self._normalize_response(response)
-                content = self._parse_or_repair_structured_content(
-                    response, response_format, model, empty_on_missing=False
-                )
-                return self._normalize_response(response, content_override=content)
-            params["response_format"] = response_format
-            try:
-                response = await self._client.chat.completions.parse(**params)
-            except LengthFinishReasonError as exc:
-                # Truncated output: repair the partial content directly. Invalid
-                # PromptRepresentation payloads raise a safe, digest-bearing error.
-                truncated = exc.completion
-                raw_content = truncated.choices[0].message.content or ""
-                content = repair_response_model_json(
-                    raw_content,
-                    response_format,
-                    model,
-                )
-                return self._normalize_response(
-                    truncated,
-                    content_override=content,
-                )
-            except ValidationError as exc:
-                # parse() validates the body itself, so a malformed one never
-                # reaches the repair path. Pydantic's message echoes the model
-                # output as input_value, so re-raise without it.
-                if response_format is not PromptRepresentation:
-                    raise
-                raise StructuredOutputError(
-                    "PromptRepresentation structured output failed "
-                    + f"failure_class=ValidationError model={model} "
-                    + f"error_count={exc.error_count()}"
-                ) from None
-            except BadRequestError:
-                # A 400 means the provider rejected the request shape — most
-                # often it doesn't support OpenAI Structured Outputs (json_schema).
-                # Retrying or re-requesting won't help (it rejects the same shape
-                # again, the latency trap of #797), so return empty rather than
-                # erroring existing flows. The warning is the signal to set
-                # structured_output_mode=json_object. There is no response body to
-                # account for, so token usage is legitimately zero here.
-                logger.warning(
-                    "Structured output via json_schema rejected by model %s; "
-                    + "set structured_output_mode=json_object if the provider does "
-                    + "not support OpenAI Structured Outputs.",
-                    model,
-                )
-                # empty_structured_output() validates {} against the model, which
-                # itself raises if the model has required fields. Fall back to
-                # empty string content rather than letting that escape the handler.
-                try:
-                    fallback_content: Any = empty_structured_output(response_format)
-                except ValidationError:
-                    fallback_content = ""
-                return CompletionResult(content=fallback_content)
-            parsed = response.choices[0].message.parsed
-            if parsed is not None:
-                raw_content = response.choices[0].message.content
-                if raw_content and response_format is PromptRepresentation:
-                    content = self._parse_or_repair_structured_content(
-                        response, response_format, model, empty_on_missing=False
-                    )
-                else:
-                    content = validate_structured_output(parsed, response_format)
-                return self._normalize_response(response, content_override=content)
-            # parse() returned no model: repair raw content, surface a refusal,
-            # or raise so the retry/fallback chain engages on a junk response.
+            }
+        elif response_format is not None:
+            params["text"] = {"format": self._convert_response_format(response_format)}
+        elif extra_params and extra_params.get("json_mode"):
+            params["text"] = {"format": {"type": "json_object"}}
+
+        try:
+            response = await self._client.responses.create(**params)
+        except BadRequestError:
+            if isinstance(response_format, type):
+                return self._structured_rejection_result(response_format, model)
+            raise
+        if isinstance(response_format, type):
+            if self._response_has_tool_calls(response):
+                return self._normalize_response(response)
             content = self._parse_or_repair_structured_content(
-                response, response_format, model, empty_on_missing=False
+                response,
+                response_format,
+                model,
+                empty_on_missing=(
+                    json_object_model is not None
+                    or getattr(response, "status", None) == "incomplete"
+                ),
             )
             return self._normalize_response(response, content_override=content)
-        if response_format is not None:
-            params["response_format"] = response_format
-
-        if extra_params and extra_params.get("json_mode"):
-            params["response_format"] = {"type": "json_object"}
-
-        response = await self._client.chat.completions.create(**params)
         return self._normalize_response(response)
 
     async def stream(
@@ -321,12 +227,12 @@ class OpenAIBackend:
         max_output_tokens: int | None = None,
         extra_params: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamChunk]:
+        del stop
         params = self._build_params(
             model=model,
             messages=messages,
             max_tokens=max_output_tokens or max_tokens,
             temperature=temperature,
-            stop=stop,
             tools=tools,
             tool_choice=tool_choice,
             thinking_effort=thinking_effort,
@@ -336,42 +242,54 @@ class OpenAIBackend:
         structured_output_mode = self._resolve_thinking_conflict(
             params, model, extra_params, response_format
         )
-        params["stream"] = True
-        params["stream_options"] = {"include_usage": True}
-        if isinstance(response_format, type):
-            if structured_output_mode == "json_object":
-                # Inject the schema into the prompt for providers without
-                # json_schema support; repair happens downstream.
-                self._apply_json_object_mode(params, response_format)
-            else:
-                # Streaming create() can't take a BaseModel like parse() does;
-                # convert to a json_schema dict.
-                params["response_format"] = self._json_schema_response_format(
-                    response_format
+        json_object_model = (
+            response_format
+            if isinstance(response_format, type)
+            and structured_output_mode == "json_object"
+            else None
+        )
+        if json_object_model is not None:
+            params["input"] = self._convert_messages(
+                self._with_json_schema_instructions(
+                    messages, json_object_model, tools_present=bool(tools)
                 )
+            )
+        if isinstance(response_format, type):
+            params["text"] = {
+                "format": self._responses_json_format(
+                    response_format, json_object=json_object_model is not None
+                )
+            }
         elif response_format is not None:
-            params["response_format"] = response_format
+            params["text"] = {"format": self._convert_response_format(response_format)}
         elif extra_params and extra_params.get("json_mode"):
-            params["response_format"] = {"type": "json_object"}
+            params["text"] = {"format": {"type": "json_object"}}
+        params["stream"] = True
 
-        response_stream = await self._client.chat.completions.create(**params)
-        finish_reason: str | None = None
-        usage_chunk_received = False
-        async for chunk in response_stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield StreamChunk(content=chunk.choices[0].delta.content)
-            if chunk.choices and chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
-            if hasattr(chunk, "usage") and chunk.usage:
+        response_stream = await self._client.responses.create(**params)
+        done = False
+        async for event in response_stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", "")
+                if delta:
+                    yield StreamChunk(content=delta)
+            elif event_type in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+            }:
+                response = event.response
+                normalized = self._normalize_response(response)
                 yield StreamChunk(
                     is_done=True,
-                    finish_reason=finish_reason,
-                    output_tokens=chunk.usage.completion_tokens,
+                    finish_reason=normalized.finish_reason,
+                    output_tokens=normalized.output_tokens,
                 )
-                usage_chunk_received = True
-
-        if not usage_chunk_received and finish_reason:
-            yield StreamChunk(is_done=True, finish_reason=finish_reason)
+                done = True
+        if not done:
+            # A prematurely closed event stream has no trustworthy usage/reason.
+            return
 
     def _build_params(
         self,
@@ -380,7 +298,6 @@ class OpenAIBackend:
         messages: list[dict[str, Any]],
         max_tokens: int,
         temperature: float | None,
-        stop: list[str] | None,
         tools: list[dict[str, Any]] | None,
         tool_choice: str | dict[str, Any] | None,
         thinking_effort: str | None,
@@ -389,54 +306,34 @@ class OpenAIBackend:
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "input": self._convert_messages(messages),
+            "max_output_tokens": max_tokens,
+            # Responses are stored by default. Honcho replays its own history, so
+            # retain Chat Completions' stateless behavior and privacy posture.
+            "store": False,
         }
-
-        if _uses_max_completion_tokens(model):
-            params["max_completion_tokens"] = max_tokens
-            if extra_params and extra_params.get("verbosity"):
-                params["verbosity"] = extra_params["verbosity"]
-        else:
-            params["max_tokens"] = max_tokens
-
         if temperature is not None:
             params["temperature"] = temperature
-
         if thinking_effort:
-            params["reasoning_effort"] = thinking_effort
-
-        # Token-budget style thinking is not part of the native OpenAI API, but
-        # OpenAI-compatible proxies (OpenRouter, etc.) accept a `reasoning` object
-        # on the request body. Pass through via extra_body so it reaches those
-        # backends. Operators on providers that need a different shape (e.g.
-        # Anthropic-via-Vertex behind litellm wants `thinking`, not `reasoning`)
-        # supply that shape via ModelConfig.provider_params.extra_body and unset
-        # thinking_budget_tokens themselves — Honcho does not try to translate.
+            params["reasoning"] = {"effort": thinking_effort}
+            # With storage disabled, encrypted reasoning lets a subsequent tool
+            # turn replay the provider's reasoning item without server-side state.
+            params["include"] = ["reasoning.encrypted_content"]
+        # Not native to Responses, but preserve the existing operator escape hatch.
         if thinking_budget_tokens is not None and thinking_budget_tokens > 0:
             params.setdefault("extra_body", {}).setdefault("reasoning", {})[
                 "max_tokens"
             ] = thinking_budget_tokens
-
-        if stop:
-            params["stop"] = stop
         if tools:
             params["tools"] = self._convert_tools(tools)
-            converted_tool_choice = self._convert_tool_choice(tool_choice)
-            if converted_tool_choice is not None:
-                params["tool_choice"] = converted_tool_choice
+            converted_choice = self._convert_tool_choice(tool_choice)
+            if converted_choice is not None:
+                params["tool_choice"] = converted_choice
         if extra_params:
-            for key in (
-                "top_p",
-                "frequency_penalty",
-                "presence_penalty",
-                "seed",
-            ):
-                if key in extra_params:
-                    params[key] = extra_params[key]
-            # Operator escape hatch: forward OpenAI SDK passthrough kwargs from
-            # ModelConfig.provider_params. Shallow merge with operator-wins —
-            # if the operator supplies `extra_body.reasoning`, it replaces any
-            # value Honcho auto-injected above.
+            if "top_p" in extra_params:
+                params["top_p"] = extra_params["top_p"]
+            if extra_params.get("verbosity"):
+                params["text"] = {"verbosity": extra_params["verbosity"]}
             apply_sdk_passthroughs(params, extra_params)
 
         timeout = request_timeout_from_extra_params(extra_params)
@@ -444,59 +341,169 @@ class OpenAIBackend:
             params["timeout"] = timeout
         return params
 
-    def _normalize_response(
-        self,
-        response: Any,
-        *,
-        content_override: Any | None = None,
-    ) -> CompletionResult:
-        usage = response.usage
-        finish_reason = response.choices[0].finish_reason
-        tool_calls: list[ToolCallResult] = []
-        message = response.choices[0].message
-        if getattr(message, "tool_calls", None):
-            for tool_call in message.tool_calls:
-                tool_input: dict[str, Any] = {}
-                if tool_call.function.arguments:
-                    try:
-                        tool_input = json.loads(tool_call.function.arguments)
-                    except (json.JSONDecodeError, TypeError) as exc:
-                        # Don't log the raw arguments payload — LLM-generated
-                        # tool calls can mirror user PII from the prompt into
-                        # their arguments, and this runs at WARN level.
-                        logger.warning(
-                            "Malformed tool arguments for %s (id=%s): %s",
-                            tool_call.function.name,
-                            tool_call.id,
-                            exc.__class__.__name__,
-                        )
-                tool_calls.append(
-                    ToolCallResult(
-                        id=tool_call.id,
-                        name=tool_call.function.name,
-                        input=tool_input,
-                    )
+    @staticmethod
+    def _convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert existing Chat-Completions-shaped history into Response input."""
+        converted: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role == "tool":
+                converted.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message["tool_call_id"],
+                        "output": str(message.get("content", "")),
+                    }
                 )
+                continue
+            if role == "assistant":
+                for detail in message.get("reasoning_details") or []:
+                    if isinstance(detail, dict) and detail.get("type") == "reasoning":
+                        converted.append(dict(detail))
+                content = message.get("content")
+                if content not in (None, ""):
+                    converted.append({"role": "assistant", "content": content})
+                for tool_call in message.get("tool_calls") or []:
+                    function = tool_call.get("function", {})
+                    converted.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tool_call["id"],
+                            "name": function.get("name", ""),
+                            "arguments": function.get("arguments", ""),
+                        }
+                    )
+                if content in (None, "") and not message.get("tool_calls"):
+                    converted.append({"role": "assistant", "content": content or ""})
+                continue
+            converted.append(
+                {
+                    key: value
+                    for key, value in message.items()
+                    if key in {"role", "content"}
+                }
+            )
+        return converted
+
+    @staticmethod
+    def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for tool in tools:
+            if tool.get("type") == "function" and "function" in tool:
+                function = tool["function"]
+                item = {
+                    "type": "function",
+                    "name": function["name"],
+                    "parameters": function.get("parameters", {}),
+                }
+                if function.get("description") is not None:
+                    item["description"] = function["description"]
+                if function.get("strict") is not None:
+                    item["strict"] = function["strict"]
+                converted.append(item)
+            else:
+                item = {
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool["input_schema"],
+                }
+                if tool.get("strict") is not None:
+                    item["strict"] = tool["strict"]
+                converted.append(item)
+        return converted
+
+    @staticmethod
+    def _convert_tool_choice(
+        tool_choice: str | dict[str, Any] | None,
+    ) -> str | dict[str, Any] | None:
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, dict):
+            if "name" in tool_choice:
+                return {"type": "function", "name": tool_choice["name"]}
+            function = tool_choice.get("function")
+            if isinstance(function, dict) and "name" in function:
+                return {"type": "function", "name": function["name"]}
+            return tool_choice
+        if tool_choice in {"any", "required"}:
+            return "required"
+        if tool_choice in {"auto", "none"}:
+            return tool_choice
+        return {"type": "function", "name": tool_choice}
+
+    @staticmethod
+    def _responses_json_format(
+        response_format: type[BaseModel], *, json_object: bool = False
+    ) -> dict[str, Any]:
+        if json_object:
+            return {"type": "json_object"}
+        return {
+            "type": "json_schema",
+            "name": response_format.__name__,
+            "schema": to_strict_json_schema(response_format),
+            "strict": True,
+        }
+
+    @staticmethod
+    def _convert_response_format(response_format: dict[str, Any]) -> dict[str, Any]:
+        if response_format.get("type") != "json_schema":
+            return dict(response_format)
+        schema = response_format.get("json_schema", {})
+        return {
+            "type": "json_schema",
+            "name": schema.get("name", "response"),
+            "schema": schema.get("schema", {}),
+            **({"strict": schema["strict"]} if "strict" in schema else {}),
+            **(
+                {"description": schema["description"]}
+                if "description" in schema
+                else {}
+            ),
+        }
+
+    def _normalize_response(
+        self, response: Any, *, content_override: Any | None = None
+    ) -> CompletionResult:
+        usage = getattr(response, "usage", None)
+        tool_calls: list[ToolCallResult] = []
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) != "function_call":
+                continue
+            tool_input: dict[str, Any] = {}
+            arguments = getattr(item, "arguments", "")
+            if arguments:
+                try:
+                    parsed = json.loads(arguments)
+                    if isinstance(parsed, dict):
+                        tool_input = parsed
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning(
+                        "Malformed tool arguments for %s (id=%s): %s",
+                        getattr(item, "name", ""),
+                        getattr(item, "call_id", ""),
+                        exc.__class__.__name__,
+                    )
+            tool_calls.append(
+                ToolCallResult(
+                    id=getattr(item, "call_id", ""),
+                    name=getattr(item, "name", ""),
+                    input=tool_input,
+                )
+            )
 
         cache_creation, cache_read = extract_openai_cache_tokens(usage)
-        # content_override=None means no override, not "force content to None"
-        if content_override is not None:
-            content: Any = content_override
-        elif message.content is not None:
-            content = message.content
-        elif tool_calls:
-            # Preserve null content on tool-call turns for history replay
-            content = None
-        else:
-            content = ""
-
         return CompletionResult(
-            content=content,
-            input_tokens=usage.prompt_tokens if usage else 0,
-            output_tokens=usage.completion_tokens if usage else 0,
+            content=(
+                content_override
+                if content_override is not None
+                else self._response_text(response)
+            ),
+            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
             cache_creation_input_tokens=cache_creation,
             cache_read_input_tokens=cache_read,
-            finish_reason=finish_reason or "stop",
+            finish_reason=self._finish_reason(response, bool(tool_calls)),
             tool_calls=tool_calls,
             thinking_content=extract_openai_reasoning_content(response),
             reasoning_details=extract_openai_reasoning_details(response),
@@ -504,25 +511,51 @@ class OpenAIBackend:
         )
 
     @staticmethod
-    def _json_schema_response_format(
-        response_format: type[BaseModel],
-    ) -> dict[str, Any]:
-        """Build the response_format param for create() calls that can't use
-        parse(): streaming, and requests carrying non-strict function tools."""
-        return {
-            "type": "json_schema",
-            "json_schema": {
-                "name": response_format.__name__,
-                "schema": response_format.model_json_schema(),
-            },
-        }
+    def _response_text(response: Any) -> str:
+        text = getattr(response, "output_text", None)
+        if isinstance(text, str) and text:
+            return text
+        refusal_parts: list[str] = []
+        text_parts: list[str] = []
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) != "message":
+                continue
+            for part in getattr(item, "content", None) or []:
+                part_type = getattr(part, "type", None)
+                value = getattr(part, "text", None)
+                if part_type == "output_text" and isinstance(value, str):
+                    text_parts.append(value)
+                refusal = getattr(part, "refusal", None)
+                if part_type == "refusal" and isinstance(refusal, str):
+                    refusal_parts.append(refusal)
+        return "".join(text_parts) or "\n".join(refusal_parts)
+
+    @staticmethod
+    def _response_has_tool_calls(response: Any) -> bool:
+        return any(
+            getattr(item, "type", None) == "function_call"
+            for item in (getattr(response, "output", None) or [])
+        )
+
+    @staticmethod
+    def _finish_reason(response: Any, has_tool_calls: bool = False) -> str:
+        if has_tool_calls:
+            return "tool_calls"
+        status = getattr(response, "status", None)
+        if status == "incomplete":
+            reason = getattr(
+                getattr(response, "incomplete_details", None), "reason", None
+            )
+            if reason == "max_output_tokens":
+                return "length"
+            return reason or "incomplete"
+        if status == "failed":
+            return "error"
+        return "stop"
 
     @staticmethod
     def _structured_output_mode(extra_params: dict[str, Any] | None) -> str | None:
-        # Threaded in via extra_params (see build_config_extra_params).
-        if not extra_params:
-            return None
-        return extra_params.get("structured_output_mode")
+        return extra_params.get("structured_output_mode") if extra_params else None
 
     @classmethod
     def _resolve_thinking_conflict(
@@ -592,7 +625,8 @@ class OpenAIBackend:
             return configured_mode
 
         logger.debug("Dropping extended thinking for %s", conflict)
-        params.pop("reasoning_effort", None)
+        params.pop("reasoning", None)
+        params.pop("include", None)
         extra_body = params.get("extra_body")
         if isinstance(extra_body, dict):
             remaining = {
@@ -612,7 +646,7 @@ class OpenAIBackend:
         or in extra_body, which the SDK merges into the body), the budget
         Honcho injects as extra_body.reasoning, or an operator-supplied
         extra_body.thinking. Explicitly disabled shapes don't count."""
-        if params.get("reasoning_effort"):
+        if params.get("reasoning", {}).get("effort") not in (None, "none"):
             return True
         extra_body = params.get("extra_body")
         if not isinstance(extra_body, dict):
@@ -632,42 +666,18 @@ class OpenAIBackend:
             return cast(dict[str, Any], thinking).get("type") != "disabled"
         return False
 
-    def _apply_json_object_mode(
-        self,
-        params: dict[str, Any],
-        response_format: type[BaseModel],
-    ) -> None:
-        """Configure params for json_object mode in place (shared by complete/stream).
-
-        Injects the schema into the prompt and requests loose JSON, so providers
-        without OpenAI Structured Outputs (json_schema) support still return JSON.
-        """
-        params["messages"] = self._with_json_schema_instructions(
-            params["messages"], response_format, tools_present=bool(params.get("tools"))
-        )
-        params["response_format"] = {"type": "json_object"}
-
     @staticmethod
     def _with_json_schema_instructions(
         messages: list[dict[str, Any]],
         response_format: type[BaseModel],
         *,
-        tools_present: bool,
+        tools_present: bool = False,
     ) -> list[dict[str, Any]]:
-        """Add JSON-schema instructions to a copy of messages for json_object mode.
-
-        The Anthropic backend has its own schema-into-prompt injection
-        (``_append_text_to_last_message``); the two are intentionally kept
-        separate since the providers want different placement and wording.
-        """
         instruction = _json_object_instruction(
             response_format, tools_present=tools_present
         )
         new_messages = [dict(message) for message in messages]
         first = new_messages[0] if new_messages else None
-        # Only merge into a leading system message when its content is a plain
-        # string; non-string content (e.g. a list of content parts) would be
-        # corrupted by f-string coercion, so prepend a fresh system message.
         if (
             first
             and first.get("role") == "system"
@@ -678,86 +688,39 @@ class OpenAIBackend:
             new_messages.insert(0, {"role": "system", "content": instruction})
         return new_messages
 
-    @staticmethod
+    @classmethod
     def _parse_or_repair_structured_content(
+        cls,
         response: Any,
         response_format: type[BaseModel],
         model: str,
         *,
         empty_on_missing: bool,
     ) -> BaseModel | str:
-        """Validate (or repair) the raw structured content of a response.
-
-        Shared by the json_object path and the json_schema parse() fallbacks
-        (truncation, parsed=None). On a contentless response with no refusal,
-        ``empty_on_missing`` selects the terminal behavior: json_object returns a
-        graceful empty so a loose provider can't crash the call, while json_schema
-        raises so the retry/fallback chain engages on a junk response.
-        """
-        message = response.choices[0].message
-        raw_content = message.content or ""
+        raw_content = cls._response_text(response)
         if raw_content:
-            # Fast path: clean, schema-relevant JSON validates directly. Route
-            # invalid or irrelevant payloads through the safe repair error path.
             try:
                 return validate_structured_output(raw_content, response_format)
             except (json.JSONDecodeError, StructuredOutputError, ValidationError):
                 return repair_response_model_json(raw_content, response_format, model)
-        refusal = getattr(message, "refusal", None)
-        if refusal:
-            return refusal
         if not empty_on_missing:
             raise StructuredOutputError("No parsed content in structured response")
-        # empty_structured_output() validates {} against the model, which itself
-        # raises if the model has required fields. Fall back to empty string
-        # content rather than letting that escape the handler.
         try:
             return empty_structured_output(response_format)
         except ValidationError:
             return ""
 
     @staticmethod
-    def _convert_tool_choice(
-        tool_choice: str | dict[str, Any] | None,
-    ) -> str | dict[str, Any] | None:
-        # Translate Honcho's canonical tool_choice vocabulary to OpenAI's. This
-        # mirrors the Anthropic/Gemini backends so a single TOOL_CHOICE value
-        # works regardless of which provider a fallback chain lands on. Notably
-        # OpenAI has no "any" — it spells the same intent "required".
-        if tool_choice is None:
-            return None
-        if isinstance(tool_choice, dict):
-            if "name" in tool_choice:
-                return {
-                    "type": "function",
-                    "function": {"name": tool_choice["name"]},
-                }
-            return tool_choice
-        if tool_choice in {"any", "required"}:
-            return "required"
-        if tool_choice in {"auto", "none"}:
-            return tool_choice
-        return {"type": "function", "function": {"name": tool_choice}}
-
-    @staticmethod
-    def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not tools or tools[0].get("type") == "function":
-            return tools
-        # Tool schemas in src/utils/agent_tools.py use optional fields with
-        # defaults and don't declare additionalProperties: false. OpenAI's
-        # strict function-calling mode forbids both, so we intentionally
-        # don't set strict: True. Standard function calling on GPT-4.x /
-        # GPT-5 remains reliable, and this stays compatible with
-        # OpenAI-compatible proxies (OpenRouter, Together, vLLM, Ollama)
-        # whose strict-mode support is inconsistent.
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"],
-                },
-            }
-            for tool in tools
-        ]
+    def _structured_rejection_result(
+        response_format: type[BaseModel], model: str
+    ) -> CompletionResult:
+        logger.warning(
+            "Structured output via json_schema rejected by model %s; set "
+            "structured_output_mode=json_object if needed.",
+            model,
+        )
+        try:
+            content: Any = empty_structured_output(response_format)
+        except ValidationError:
+            content = ""
+        return CompletionResult(content=content)
