@@ -1065,12 +1065,12 @@ def _default_dialectic_levels() -> dict[ReasoningLevel, DialecticLevelSettings]:
             MODEL_CONFIG=_default_model_config(),
             MAX_TOOL_ITERATIONS=1,
             MAX_OUTPUT_TOKENS=250,
-            TOOL_CHOICE="auto",
+            TOOL_CHOICE="required",
         ),
         "low": DialecticLevelSettings(
             MODEL_CONFIG=_default_model_config(),
             MAX_TOOL_ITERATIONS=5,
-            TOOL_CHOICE="auto",
+            TOOL_CHOICE="required",
         ),
         "medium": DialecticLevelSettings(
             MODEL_CONFIG=_default_model_config(),
