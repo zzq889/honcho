@@ -7,17 +7,14 @@ the truncated output is repaired and returned instead of crashing.
 """
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock, Usage
-from openai import AsyncOpenAI, LengthFinishReasonError
-from openai.types.chat import ChatCompletion
-from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
-from openai.types.completion_usage import CompletionUsage
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from src.llm import CLIENTS, HonchoLLMCallResponse, honcho_llm_call_inner
@@ -42,30 +39,25 @@ VALID_REPR_JSON = {
 }
 
 
-def _make_truncated_completion(content: str) -> ChatCompletion:
-    """Build a ChatCompletion with finish_reason='length' and the given content."""
-    return ChatCompletion(
-        id="test-truncated",
-        object="chat.completion",
-        created=1234567890,
-        model="test-model",
-        choices=[
-            Choice(
-                index=0,
-                message=ChatCompletionMessage(role="assistant", content=content),
-                finish_reason="length",
-            )
-        ],
-        usage=CompletionUsage(
-            prompt_tokens=1000, completion_tokens=2000, total_tokens=3000
+def _make_truncated_completion(content: str) -> SimpleNamespace:
+    """Build a Responses-shaped incomplete response with truncated text."""
+    return SimpleNamespace(
+        output_text=content,
+        output=[],
+        output_parsed=None,
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        usage=SimpleNamespace(
+            input_tokens=1000,
+            output_tokens=2000,
+            input_tokens_details=None,
         ),
     )
 
 
-def _raise_length_error(content: str) -> AsyncMock:
-    """Return an AsyncMock that raises LengthFinishReasonError with truncated content."""
-    completion = _make_truncated_completion(content)
-    return AsyncMock(side_effect=LengthFinishReasonError(completion=completion))
+def _incomplete_response(content: str) -> AsyncMock:
+    """Return an incomplete Responses API result with truncated content."""
+    return AsyncMock(return_value=_make_truncated_completion(content))
 
 
 def _make_anthropic_mock(text: str, stop_reason: str = "end_turn") -> AsyncMock:
@@ -121,20 +113,20 @@ def _make_gemini_mock(
 
 
 # ---------------------------------------------------------------------------
-# OpenAI / Custom provider tests (LengthFinishReasonError path)
+# OpenAI Responses API incomplete-output repair tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestOpenAILengthFinishReasonRepair:
-    """Tests that LengthFinishReasonError is caught and truncated JSON is repaired."""
+    """Tests that incomplete Responses output is repaired from raw text."""
 
     async def test_truncated_prompt_representation_repaired_openai(self) -> None:
         """Truncated but repairable PromptRepresentation JSON should be repaired (openai)."""
         truncated_json = json.dumps(VALID_REPR_JSON)[:-2]
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error(truncated_json)
+        mock_client.responses.create = _incomplete_response(truncated_json)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
@@ -159,7 +151,7 @@ class TestOpenAILengthFinishReasonRepair:
         truncated_json = json.dumps(VALID_REPR_JSON)[:-2]
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error(truncated_json)
+        mock_client.responses.create = _incomplete_response(truncated_json)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
@@ -179,7 +171,7 @@ class TestOpenAILengthFinishReasonRepair:
     async def test_completely_broken_json_falls_back_to_empty(self) -> None:
         """Completely unrepairable JSON should fall back to empty PromptRepresentation."""
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error(
+        mock_client.responses.create = _incomplete_response(
             "this is not json at all just random text"
         )
 
@@ -200,7 +192,7 @@ class TestOpenAILengthFinishReasonRepair:
     async def test_empty_content_falls_back_to_empty(self) -> None:
         """Empty/null content should fall back to empty PromptRepresentation."""
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error("")
+        mock_client.responses.create = _incomplete_response("")
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
@@ -218,7 +210,7 @@ class TestOpenAILengthFinishReasonRepair:
     async def test_non_prompt_representation_reraises_on_unfixable(self) -> None:
         """Non-PromptRepresentation with unrepairable JSON should raise ValidationError."""
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error("not json")
+        mock_client.responses.create = _incomplete_response("not json")
 
         with (
             patch.dict(CLIENTS, {"openai": mock_client}),
@@ -238,7 +230,7 @@ class TestOpenAILengthFinishReasonRepair:
         truncated_json = '{"explicit": [{"content": "fact one"}'
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error(truncated_json)
+        mock_client.responses.create = _incomplete_response(truncated_json)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
@@ -258,7 +250,7 @@ class TestOpenAILengthFinishReasonRepair:
         valid_json = json.dumps(VALID_REPR_JSON)
 
         mock_client = AsyncMock(spec=AsyncOpenAI)
-        mock_client.chat.completions.parse = _raise_length_error(valid_json)
+        mock_client.responses.create = _incomplete_response(valid_json)
 
         with patch.dict(CLIENTS, {"openai": mock_client}):
             response = await honcho_llm_call_inner(
