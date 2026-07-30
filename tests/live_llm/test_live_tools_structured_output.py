@@ -186,27 +186,17 @@ async def test_live_openai_tools_with_structured_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_provider_key(model_spec)
-    # gpt-5.4 rejects function tools combined with any explicit
-    # reasoning_effort other than 'none' on /v1/chat/completions, so leave
-    # the parameter unset and let the server default apply.
     backend, config = make_backend(model_spec)
-    parse_calls = wrap_async_method(
-        monkeypatch, backend._client.chat.completions, "parse"
-    )
-    create_calls = wrap_async_method(
-        monkeypatch, backend._client.chat.completions, "create"
-    )
+    create_calls = wrap_async_method(monkeypatch, backend._client.responses, "create")
 
     await run_tool_then_structured_flow(backend, config, OpenAIHistoryAdapter())
 
-    # favorite_prime_tools() is deliberately non-strict, the exact shape
-    # parse() refuses with a 500.
-    assert not parse_calls, "tool-carrying structured requests must avoid parse()"
     assert len(create_calls) >= 2
     for call in create_calls:
-        response_format = call["kwargs"]["response_format"]
+        response_format = call["kwargs"]["text"]["format"]
         assert response_format["type"] == "json_schema"
-        assert response_format["json_schema"]["name"] == "FavoritePrimeReport"
+        assert response_format["name"] == "FavoritePrimeReport"
+        assert "input" in call["kwargs"]
 
 
 @pytest.mark.asyncio
