@@ -294,7 +294,14 @@ async def test_chat_shaped_tool_and_reasoning_history_is_converted() -> None:
         {
             "role": "assistant",
             "content": None,
-            "reasoning_details": [{"type": "reasoning", "id": "rs_1", "summary": []}],
+            "reasoning_details": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "status": "completed",
+                }
+            ],
             "tool_calls": [
                 {
                     "id": "call_1",
@@ -313,6 +320,7 @@ async def test_chat_shaped_tool_and_reasoning_history_is_converted() -> None:
     call = _await_kwargs(client.responses.create)
     assert call["input"] == [
         {"role": "user", "content": "Search"},
+        # ``status`` is output-only in the live API and must not be replayed.
         {"type": "reasoning", "id": "rs_1", "summary": []},
         {
             "type": "function_call",
