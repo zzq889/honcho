@@ -327,7 +327,13 @@ class OpenAIBackend:
             if role == "assistant":
                 for detail in message.get("reasoning_details") or []:
                     if isinstance(detail, dict) and detail.get("type") == "reasoning":
-                        converted.append(dict(detail))
+                        # The SDK's response model includes ``status`` and its
+                        # input TypedDict currently advertises it too, but the
+                        # live Responses endpoint rejects replayed reasoning
+                        # items containing that output-only field.
+                        converted.append(
+                            {key: value for key, value in detail.items() if key != "status"}
+                        )
                 content = message.get("content")
                 if content not in (None, ""):
                     converted.append({"role": "assistant", "content": content})
