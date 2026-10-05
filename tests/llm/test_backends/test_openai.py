@@ -110,18 +110,29 @@ async def test_plain_text_uses_responses_and_normalizes_usage_and_reasoning() ->
 
 
 @pytest.mark.asyncio
-async def test_all_model_names_use_responses_api() -> None:
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-5.4-mini", "gpt-6", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"],
+)
+async def test_all_model_names_use_responses_api(model: str) -> None:
+    """GPT-6 support uses Responses tokens, not the upstream chat-only fix."""
     client = Mock()
     client.responses.create = AsyncMock(return_value=_response("ok"))
 
     result = await OpenAIBackend(client).complete(
-        model="gpt-5.4-mini",
+        model=model,
         messages=[{"role": "user", "content": "Hello"}],
         max_tokens=50,
     )
 
     assert result.content == "ok"
     client.responses.create.assert_awaited_once()
+    call = _await_kwargs(client.responses.create)
+    assert call["model"] == model
+    assert call["max_output_tokens"] == 50
+    assert "max_tokens" not in call
+    assert "max_completion_tokens" not in call
+    client.chat.completions.create.assert_not_called()
 
 
 @pytest.mark.asyncio
