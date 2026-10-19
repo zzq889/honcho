@@ -205,7 +205,7 @@ class OpenAIBackend:
                 model,
                 empty_on_missing=(
                     json_object_model is not None
-                    or getattr(response, "status", None) == "incomplete"
+                    and getattr(response, "status", None) != "incomplete"
                 ),
             )
             return self._normalize_response(response, content_override=content)
@@ -364,7 +364,11 @@ class OpenAIBackend:
                         # live Responses endpoint rejects replayed reasoning
                         # items containing that output-only field.
                         converted.append(
-                            {key: value for key, value in detail.items() if key != "status"}
+                            {
+                                key: value
+                                for key, value in detail.items()
+                                if key != "status"
+                            }
                         )
                 content = message.get("content")
                 if content not in (None, ""):

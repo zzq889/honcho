@@ -11,12 +11,12 @@ from openai import BadRequestError
 from pydantic import BaseModel
 
 from src.exceptions import ValidationException
-from src.llm.structured_output import StructuredOutputError
 from src.llm.backends.openai import (
     OpenAIBackend,
     _json_object_instruction,  # pyright: ignore[reportPrivateUsage]
     extract_openai_cache_tokens,
 )
+from src.llm.structured_output import StructuredOutputError
 from src.utils.representation import PromptRepresentation
 
 
