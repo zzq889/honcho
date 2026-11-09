@@ -509,8 +509,8 @@ class OpenAIBackend:
                 if content_override is not None
                 else self._response_text(response)
             ),
-            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
-            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+            input_tokens=(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
+            output_tokens=(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
             cache_creation_input_tokens=cache_creation,
             cache_read_input_tokens=cache_read,
             finish_reason=self._finish_reason(response, bool(tool_calls)),

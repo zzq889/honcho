@@ -73,6 +73,22 @@ def _bad_request_error() -> BadRequestError:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "usage", [None, SimpleNamespace(input_tokens=None, output_tokens=None)]
+)
+async def test_missing_responses_usage_counts_become_zero(usage: Any) -> None:
+    response = _response("ok")
+    response.usage = usage
+    client = Mock()
+    client.responses.create = AsyncMock(return_value=response)
+    result = await OpenAIBackend(client).complete(
+        model="gpt-6-luna", messages=[{"role": "user", "content": "Hi"}], max_tokens=100
+    )
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
+
+
+@pytest.mark.asyncio
 async def test_plain_text_uses_responses_and_normalizes_usage_and_reasoning() -> None:
     reasoning = SimpleNamespace(
         type="reasoning",
@@ -281,9 +297,10 @@ async def test_function_tools_and_tool_choices(
 
 
 @pytest.mark.asyncio
-async def test_malformed_function_arguments_are_nonfatal() -> None:
+@pytest.mark.parametrize("arguments", ['"{\\"query\\": 1}"', "[1]", "null", "{bad"])
+async def test_malformed_function_arguments_are_nonfatal(arguments: str) -> None:
     item = SimpleNamespace(
-        type="function_call", call_id="call_bad", name="search", arguments="{bad"
+        type="function_call", call_id="call_bad", name="search", arguments=arguments
     )
     client = Mock()
     client.responses.create = AsyncMock(return_value=_response(output=[item]))
@@ -560,6 +577,7 @@ async def test_malformed_representation_is_safely_rejected(text: str) -> None:
         )
     assert "private-sentinel" not in str(exc.value)
     assert "payload_sha256=" in str(exc.value)
+    assert exc.value.raw_content == text
 
 
 @pytest.mark.asyncio

@@ -21,20 +21,20 @@ def _no_retry_wait(**_kwargs: Any) -> wait_none:
     ("usage", "expected_input", "expected_output"),
     [
         pytest.param(
-            {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19},
+            {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
             12,
             7,
             id="full-usage",
         ),
         pytest.param({"total_tokens": 19}, 0, 0, id="both-counts-omitted"),
         pytest.param(
-            {"completion_tokens": 7, "total_tokens": 19},
+            {"output_tokens": 7, "total_tokens": 19},
             0,
             7,
             id="prompt-count-omitted",
         ),
         pytest.param(
-            {"prompt_tokens": 12, "total_tokens": 19},
+            {"input_tokens": 12, "total_tokens": 19},
             12,
             0,
             id="completion-count-omitted",
@@ -53,17 +53,21 @@ async def test_omitted_usage_survives_real_sdk_and_full_call_without_retry(
     def handle(request: httpx.Request) -> httpx.Response:
         nonlocal provider_requests
         provider_requests += 1
-        assert request.url.path == "/v1/chat/completions"
+        assert request.url.path == "/v1/responses"
         payload: dict[str, Any] = {
-            "id": "chatcmpl-usage-test",
-            "object": "chat.completion",
-            "created": 1,
+            "id": "resp-usage-test",
+            "object": "response",
+            "status": "completed",
+            "created_at": 1,
             "model": "gpt-4.1-nano",
-            "choices": [
+            "output": [
                 {
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "Hello"},
+                    "id": "msg-test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Hello", "annotations": []}
+                    ],
                 }
             ],
         }

@@ -6,8 +6,11 @@ from src.llm.request_builder import execute_completion
 
 from .conftest import (
     StructuredLiveResponse,
+    execute_local_tool,
+    favorite_prime_tools,
     make_backend,
     make_large_system_prompt,
+    replay_tool_round,
     require_provider_key,
     wrap_async_method,
 )
@@ -186,3 +189,45 @@ async def test_live_openai_json_object_structured_output(
     assert result.content.provider == "openai"
     assert create_calls, "expected a responses.create call"
     assert create_calls[0]["kwargs"]["text"] == {"format": {"type": "json_object"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_spec", _GPT5_SPECS, ids=lambda spec: spec.id)
+async def test_live_openai_typed_history_replays_responses_tools(
+    model_spec: LiveModelSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    require_provider_key(model_spec)
+    backend, config = make_backend(model_spec, reasoning_effort="low")
+    calls = wrap_async_method(monkeypatch, backend._client.responses, "create")
+    tools = favorite_prime_tools()
+    messages = [
+        {
+            "role": "user",
+            "content": "Use the tool to find my favorite prime, then report it.",
+        }
+    ]
+    first = await execute_completion(
+        backend,
+        config,
+        messages=messages,
+        max_tokens=2048,
+        tools=tools,
+        tool_choice="required",
+    )
+    assert first.tool_calls
+    tool = first.tool_calls[0]
+    replay = replay_tool_round(
+        config, messages, first, execute_local_tool(tool.name, tool.input)
+    )
+    second = await execute_completion(
+        backend,
+        config,
+        messages=replay,
+        max_tokens=2048,
+        tools=tools,
+        tool_choice="none",
+    )
+    assert isinstance(second.content, str) and second.content
+    wire = calls[-1]["kwargs"]["input"]
+    assert any(item.get("type") == "function_call_output" for item in wire)
+    assert all("status" not in item for item in wire if item.get("type") == "reasoning")
